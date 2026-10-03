@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Vexlore Quantumproof Chain  v0.2 — NETWORK
-A free, post-quantum blockchain prototype.
+Vexlore Quantumproof Chain  v0.3 — BETTER CHAIN
+A free educational post-quantum blockchain prototype.
 
 Uses ML-DSA (FIPS 204 / Dilithium) for quantum-resistant signatures.
-v0.2 adds basic peer-to-peer networking: nodes share blocks & auto-sync.
+v0.3: adaptive difficulty, better mempool, bigger blocks, faster validation, atomic saves.
 
 Not production-ready — for learning and experimentation only.
 """
@@ -16,10 +16,11 @@ import json
 import os
 import socket
 import sys
+import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -41,13 +42,24 @@ except ImportError:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants  (v0.3)
 # ---------------------------------------------------------------------------
 CHAIN_NAME = "Vexlore Quantumproof Chain"
-VERSION = "0.2.0-network"
-DIFFICULTY = 3          # leading zero hex digits for PoW (demo level)
+VERSION = "0.3.0-better-chain"
+
+# Mining / difficulty
+INITIAL_DIFFICULTY = 3
+TARGET_BLOCK_TIME = 20          # seconds we want between blocks
+DIFFICULTY_ADJUST_EVERY = 5     # adjust every N blocks
+MIN_DIFFICULTY = 2
+MAX_DIFFICULTY = 6
+
+# Block limits
+MAX_TX_PER_BLOCK = 50           # bigger blocks support
+
+# Network
 DEFAULT_PORT = 5000
-SYNC_INTERVAL = 15      # seconds between background peer polls
+SYNC_INTERVAL = 15
 
 DATA_DIR = Path(__file__).parent / "data"
 CHAIN_FILE = DATA_DIR / "vexlore_chain.json"
@@ -62,7 +74,6 @@ WALLETS_DIR.mkdir(exist_ok=True)
 # Crypto helpers (post-quantum)
 # ---------------------------------------------------------------------------
 def pq_keygen() -> Tuple[bytes, bytes]:
-    """Generate ML-DSA-44 keypair (public, secret)."""
     return ML_DSA_44.keygen()
 
 
@@ -79,7 +90,6 @@ def sha256(data: bytes) -> str:
 
 
 def address_from_pubkey(pubkey: bytes) -> str:
-    """Simple address: VEX + first 20 hex chars of hash of pubkey."""
     h = sha256(pubkey)
     return "VEX" + h[:20]
 
@@ -90,12 +100,12 @@ def address_from_pubkey(pubkey: bytes) -> str:
 @dataclass
 class Transaction:
     tx_id: str
-    sender: str          # address
-    recipient: str       # address
+    sender: str
+    recipient: str
     amount: float
     timestamp: float
-    public_key: str      # hex of ML-DSA public key
-    signature: str       # hex of ML-DSA signature
+    public_key: str
+    signature: str
     memo: str = ""
 
     def message_to_sign(self) -> bytes:
@@ -131,6 +141,7 @@ class Block:
     timestamp: float
     transactions: List[Transaction]
     previous_hash: str
+    difficulty: int = INITIAL_DIFFICULTY
     nonce: int = 0
     hash: str = ""
     miner: str = "genesis"
@@ -143,6 +154,7 @@ class Block:
                 "timestamp": self.timestamp,
                 "transactions": tx_data,
                 "previous_hash": self.previous_hash,
+                "difficulty": self.difficulty,
                 "nonce": self.nonce,
                 "miner": self.miner,
             },
@@ -151,8 +163,8 @@ class Block:
         )
         return sha256(block_string.encode())
 
-    def mine(self, difficulty: int = DIFFICULTY) -> None:
-        target = "0" * difficulty
+    def mine(self) -> None:
+        target = "0" * self.difficulty
         while True:
             self.hash = self.compute_hash()
             if self.hash.startswith(target):
@@ -165,6 +177,7 @@ class Block:
             "timestamp": self.timestamp,
             "transactions": [t.to_dict() for t in self.transactions],
             "previous_hash": self.previous_hash,
+            "difficulty": self.difficulty,
             "nonce": self.nonce,
             "hash": self.hash,
             "miner": self.miner,
@@ -178,6 +191,7 @@ class Block:
             timestamp=d["timestamp"],
             transactions=txs,
             previous_hash=d["previous_hash"],
+            difficulty=d.get("difficulty", INITIAL_DIFFICULTY),
             nonce=d.get("nonce", 0),
             hash=d.get("hash", ""),
             miner=d.get("miner", ""),
@@ -238,7 +252,7 @@ class Wallet:
             amount=amount,
             timestamp=time.time(),
             public_key=self.public_key.hex(),
-            signature="",  # filled next
+            signature="",
             memo=memo,
         )
         sig = pq_sign(self.secret_key, tx.message_to_sign())
@@ -247,21 +261,27 @@ class Wallet:
 
 
 # ---------------------------------------------------------------------------
-# Blockchain
+# Blockchain  (v0.3 improvements)
 # ---------------------------------------------------------------------------
 class VexloreChain:
     def __init__(self):
         self.chain: List[Block] = []
-        self.pending: List[Transaction] = []
+        self.pending: List[Transaction] = []   # mempool
         self.balances: Dict[str, float] = {}
+        self.current_difficulty = INITIAL_DIFFICULTY
         self._load_or_create()
 
     def _load_or_create(self) -> None:
         if CHAIN_FILE.exists():
-            raw = json.loads(CHAIN_FILE.read_text())
-            self.chain = [Block.from_dict(b) for b in raw["chain"]]
-            self.balances = raw.get("balances", {})
-            print(f"[+] Loaded chain with {len(self.chain)} blocks")
+            try:
+                raw = json.loads(CHAIN_FILE.read_text())
+                self.chain = [Block.from_dict(b) for b in raw["chain"]]
+                self.balances = raw.get("balances", {})
+                self.current_difficulty = raw.get("difficulty", INITIAL_DIFFICULTY)
+                print(f"[+] Loaded chain with {len(self.chain)} blocks (diff={self.current_difficulty})")
+            except Exception as e:
+                print(f"[!] Failed to load chain: {e}")
+                self._create_genesis()
         else:
             self._create_genesis()
 
@@ -282,41 +302,83 @@ class VexloreChain:
             timestamp=time.time(),
             transactions=[genesis_tx],
             previous_hash="0" * 64,
+            difficulty=INITIAL_DIFFICULTY,
             miner="genesis",
         )
         block.hash = block.compute_hash()
         self.chain.append(block)
+        self.current_difficulty = INITIAL_DIFFICULTY
         self._save()
         print(f"[+] Genesis block created: {block.hash[:16]}...")
+
+    def _atomic_save(self, data: dict) -> None:
+        """Safe write – never corrupts the file even if power is lost."""
+        fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, CHAIN_FILE)  # atomic on most systems
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
     def _save(self) -> None:
         data = {
             "name": CHAIN_NAME,
             "version": VERSION,
             "algo": "ML-DSA-44 (FIPS 204)",
+            "difficulty": self.current_difficulty,
             "chain": [b.to_dict() for b in self.chain],
             "balances": self.balances,
         }
-        CHAIN_FILE.write_text(json.dumps(data, indent=2))
+        self._atomic_save(data)
 
     @property
     def last_block(self) -> Block:
         return self.chain[-1]
 
-    def add_transaction(self, tx: Transaction, broadcast: bool = False) -> bool:
+    def _adjust_difficulty(self) -> int:
+        """Adaptive difficulty – tries to keep block time near TARGET_BLOCK_TIME."""
+        if len(self.chain) < DIFFICULTY_ADJUST_EVERY + 1:
+            return self.current_difficulty
+
+        # look at the last N blocks
+        recent = self.chain[-DIFFICULTY_ADJUST_EVERY:]
+        time_taken = recent[-1].timestamp - recent[0].timestamp
+        expected = TARGET_BLOCK_TIME * (DIFFICULTY_ADJUST_EVERY - 1)
+
+        new_diff = self.current_difficulty
+        if time_taken < expected * 0.7:          # too fast → harder
+            new_diff = min(MAX_DIFFICULTY, self.current_difficulty + 1)
+        elif time_taken > expected * 1.4:        # too slow → easier
+            new_diff = max(MIN_DIFFICULTY, self.current_difficulty - 1)
+
+        if new_diff != self.current_difficulty:
+            print(f"[*] Difficulty adjusted: {self.current_difficulty} → {new_diff}")
+        return new_diff
+
+    def add_transaction(self, tx: Transaction) -> bool:
         if not tx.verify() and tx.sender != "VEXLORE_NETWORK":
             print("[-] Invalid quantum signature – transaction rejected")
             return False
-        # simple balance check (except faucet-style)
+
         sender_bal = self.balances.get(tx.sender, 0.0)
         if tx.sender != "VEXLORE_NETWORK" and sender_bal < tx.amount:
             print(f"[-] Insufficient balance: {sender_bal} < {tx.amount}")
             return False
-        # dedup by tx_id
+
+        # dedup
         if any(p.tx_id == tx.tx_id for p in self.pending):
             return False
+
+        # mempool size limit
+        if len(self.pending) >= MAX_TX_PER_BLOCK * 3:
+            print("[-] Mempool full – try mining first")
+            return False
+
         self.pending.append(tx)
-        print(f"[+] Pending tx {tx.tx_id[:8]}... {tx.amount} VEX → {tx.recipient[:12]}...")
+        print(f"[+] Pending tx {tx.tx_id[:8]}... {tx.amount} VEX → {tx.recipient[:12]}...  (mempool: {len(self.pending)})")
         return True
 
     def mine_pending(self, miner_address: str) -> Optional[Block]:
@@ -324,29 +386,38 @@ class VexloreChain:
             print("[-] No pending transactions to mine")
             return None
 
-        # reward the miner
+        # take up to MAX_TX_PER_BLOCK transactions
+        txs_to_include = self.pending[:MAX_TX_PER_BLOCK]
+        remaining = self.pending[MAX_TX_PER_BLOCK:]
+
+        # reward
         reward = Transaction(
             tx_id=str(uuid.uuid4()),
             sender="VEXLORE_NETWORK",
             recipient=miner_address,
-            amount=10.0,  # block reward
+            amount=10.0,
             timestamp=time.time(),
             public_key="",
             signature="",
             memo="Block reward",
         )
-        txs = self.pending + [reward]
+        txs = txs_to_include + [reward]
+
+        # decide difficulty for this block
+        self.current_difficulty = self._adjust_difficulty()
 
         block = Block(
             index=len(self.chain),
             timestamp=time.time(),
             transactions=txs,
             previous_hash=self.last_block.hash,
+            difficulty=self.current_difficulty,
             miner=miner_address,
         )
-        print(f"[*] Mining block #{block.index} (difficulty {DIFFICULTY}) ...")
+
+        print(f"[*] Mining block #{block.index} (difficulty {block.difficulty}, {len(txs)-1} txs) ...")
         start = time.time()
-        block.mine(DIFFICULTY)
+        block.mine()
         elapsed = time.time() - start
         print(f"[+] Block mined in {elapsed:.2f}s  hash={block.hash}")
 
@@ -357,7 +428,7 @@ class VexloreChain:
             self.balances[tx.recipient] = self.balances.get(tx.recipient, 0.0) + tx.amount
 
         self.chain.append(block)
-        self.pending = []
+        self.pending = remaining   # keep the rest in mempool
         self._save()
         return block
 
@@ -365,31 +436,38 @@ class VexloreChain:
         return self.balances.get(address, 0.0)
 
     def is_valid(self, chain: Optional[List[Block]] = None) -> bool:
-        """Validate self.chain or an external chain list."""
+        """Faster validation – early exits + only full check when needed."""
         blocks = chain if chain is not None else self.chain
         if not blocks:
             return False
-        # genesis check
+
+        # quick genesis check
         if blocks[0].index != 0 or blocks[0].previous_hash != "0" * 64:
             return False
+
         for i in range(1, len(blocks)):
             current = blocks[i]
             previous = blocks[i - 1]
-            if current.hash != current.compute_hash():
+
+            # fast structural checks first
+            if current.index != previous.index + 1:
                 return False
             if current.previous_hash != previous.hash:
                 return False
-            if not current.hash.startswith("0" * DIFFICULTY):
+            if not current.hash.startswith("0" * current.difficulty):
                 return False
-            if current.index != previous.index + 1:
+
+            # expensive hash check
+            if current.hash != current.compute_hash():
                 return False
+
+            # signature checks (skip network rewards)
             for tx in current.transactions:
                 if tx.sender != "VEXLORE_NETWORK" and not tx.verify():
                     return False
         return True
 
     def faucet(self, address: str, amount: float = 100.0) -> None:
-        """Give free test tokens (only for demo)."""
         tx = Transaction(
             tx_id=str(uuid.uuid4()),
             sender="VEXLORE_NETWORK",
@@ -401,10 +479,9 @@ class VexloreChain:
             memo="Faucet drop",
         )
         self.pending.append(tx)
-        print(f"[+] Faucet: {amount} VEX queued for {address}")
+        print(f"[+] Faucet: {amount} VEX queued for {address}  (mempool: {len(self.pending)})")
 
     def replace_chain(self, new_blocks: List[Block]) -> bool:
-        """Replace local chain if the new one is longer and valid."""
         if len(new_blocks) <= len(self.chain):
             return False
         if not self.is_valid(new_blocks):
@@ -412,53 +489,50 @@ class VexloreChain:
             return False
         print(f"[+] Adopting longer chain ({len(self.chain)} → {len(new_blocks)} blocks)")
         self.chain = new_blocks
-        # rebuild balances from scratch
+        # rebuild balances
         self.balances = {}
         for block in self.chain:
             for tx in block.transactions:
                 if tx.sender != "VEXLORE_NETWORK":
                     self.balances[tx.sender] = self.balances.get(tx.sender, 0.0) - tx.amount
                 self.balances[tx.recipient] = self.balances.get(tx.recipient, 0.0) + tx.amount
-        self.pending = []  # clear mempool on reorg
+        self.pending = []
+        self.current_difficulty = self.chain[-1].difficulty
         self._save()
         return True
 
     def add_block_from_peer(self, block: Block) -> bool:
-        """Accept a single new block from a peer (must extend our tip)."""
         if block.index != len(self.chain):
             return False
         if block.previous_hash != self.last_block.hash:
             return False
         if block.hash != block.compute_hash():
             return False
-        if not block.hash.startswith("0" * DIFFICULTY):
+        if not block.hash.startswith("0" * block.difficulty):
             return False
         for tx in block.transactions:
             if tx.sender != "VEXLORE_NETWORK" and not tx.verify():
                 return False
 
-        # apply balances
         for tx in block.transactions:
             if tx.sender != "VEXLORE_NETWORK":
                 self.balances[tx.sender] = self.balances.get(tx.sender, 0.0) - tx.amount
             self.balances[tx.recipient] = self.balances.get(tx.recipient, 0.0) + tx.amount
 
-        # remove any pending txs that are now confirmed
         confirmed_ids = {t.tx_id for t in block.transactions}
         self.pending = [t for t in self.pending if t.tx_id not in confirmed_ids]
 
         self.chain.append(block)
+        self.current_difficulty = block.difficulty
         self._save()
         print(f"[+] Accepted block #{block.index} from peer  hash={block.hash[:16]}...")
         return True
 
 
 # ---------------------------------------------------------------------------
-# Networking  (v0.2)
+# Networking  (same as v0.2, small cleanups)
 # ---------------------------------------------------------------------------
 class PeerManager:
-    """Manages the list of known peers and basic gossip."""
-
     def __init__(self, self_url: str = ""):
         self.self_url = self_url.rstrip("/")
         self.peers: Set[str] = set()
@@ -481,9 +555,7 @@ class PeerManager:
         url = url.rstrip("/")
         if not url.startswith("http"):
             url = "http://" + url
-        if url == self.self_url:
-            return False
-        if url in self.peers:
+        if url == self.self_url or url in self.peers:
             return False
         self.peers.add(url)
         self._save()
@@ -543,14 +615,10 @@ class PeerManager:
 
 
 class NodeHTTPHandler(BaseHTTPRequestHandler):
-    """Minimal HTTP API for a Vexlore node."""
-
-    # injected by NodeServer
     chain: VexloreChain
     peers: PeerManager
 
     def log_message(self, fmt: str, *args) -> None:
-        # quieter logs
         print(f"  [HTTP] {self.address_string()} {fmt % args}")
 
     def _json_response(self, code: int, obj: Any) -> None:
@@ -579,8 +647,9 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
                 "name": CHAIN_NAME,
                 "version": VERSION,
                 "blocks": len(self.chain.chain),
+                "difficulty": self.chain.current_difficulty,
+                "mempool": len(self.chain.pending),
                 "peers": len(self.peers.peers),
-                "pending": len(self.chain.pending),
             })
         elif path == "/chain":
             self._json_response(200, {
@@ -591,14 +660,16 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
             self._json_response(200, {
                 "version": VERSION,
                 "blocks": len(self.chain.chain),
+                "difficulty": self.chain.current_difficulty,
                 "last_hash": self.chain.last_block.hash,
-                "pending": len(self.chain.pending),
+                "mempool": len(self.chain.pending),
                 "peers": self.peers.list(),
             })
         elif path == "/peers":
             self._json_response(200, {"peers": self.peers.list()})
-        elif path == "/pending":
+        elif path == "/pending" or path == "/mempool":
             self._json_response(200, {
+                "count": len(self.chain.pending),
                 "pending": [t.to_dict() for t in self.chain.pending]
             })
         else:
@@ -619,11 +690,9 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
                 return
             ok = self.chain.add_block_from_peer(block)
             if ok:
-                # gossip further (simple, one hop)
                 self.peers.broadcast_block(block)
                 self._json_response(200, {"status": "accepted"})
             else:
-                # maybe we are behind – try full sync later
                 self._json_response(409, {"status": "rejected"})
 
         elif path == "/transaction":
@@ -639,7 +708,6 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
             self._json_response(200 if ok else 409, {"status": "ok" if ok else "rejected"})
 
         elif path == "/peers":
-            # register a new peer
             url = (data or {}).get("url", "")
             if url:
                 self.peers.add(url)
@@ -647,22 +715,15 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
             else:
                 self._json_response(400, {"error": "url required"})
 
-        elif path == "/sync":
-            # force a sync round (useful for testing)
-            self._json_response(200, {"status": "sync triggered"})
-
         else:
             self._json_response(404, {"error": "not found"})
 
 
 class NodeServer:
-    """Runs the HTTP server + background sync loop."""
-
     def __init__(self, chain: VexloreChain, port: int = DEFAULT_PORT, host: str = "0.0.0.0"):
         self.chain = chain
         self.port = port
         self.host = host
-        # discover a usable self URL
         local_ip = self._guess_local_ip()
         self.self_url = f"http://{local_ip}:{port}"
         self.peers = PeerManager(self.self_url)
@@ -709,7 +770,6 @@ class NodeServer:
             self._stop.wait(SYNC_INTERVAL)
 
     def sync_with_peers(self) -> None:
-        """Pull longest valid chain from peers and exchange peer lists."""
         if not self.peers.peers:
             return
         best_chain: Optional[List[Block]] = None
@@ -721,11 +781,9 @@ class NodeServer:
                 best_chain = remote
                 best_len = len(remote)
 
-            # learn new peers
             for p in self.peers.fetch_peers(peer):
                 self.peers.add(p)
 
-            # introduce ourselves
             try:
                 requests.post(f"{peer}/peers", json={"url": self.self_url}, timeout=4)
             except Exception:
@@ -736,7 +794,6 @@ class NodeServer:
 
     def add_peer(self, url: str) -> None:
         if self.peers.add(url):
-            # immediate handshake
             try:
                 requests.post(f"{url.rstrip('/')}/peers", json={"url": self.self_url}, timeout=5)
             except Exception as e:
@@ -756,9 +813,9 @@ def print_banner():
    \ V /  __/>  <| | (_) | | |  __/ 
     \_/ \___/_/\_\_|\___/|_|  \___| 
                                     
-  Quantumproof Chain  v0.2  — NETWORK
+  Quantumproof Chain  v0.3  — BETTER CHAIN
+  Adaptive difficulty • Bigger blocks • Safe saves
   Post-quantum signatures: ML-DSA-44 (FIPS 204)
-  Nodes share blocks & auto-sync
 """
     )
 
@@ -769,7 +826,6 @@ def main():
     wallet = Wallet("alice")
     node: Optional[NodeServer] = None
 
-    # auto-start node on default port if free, otherwise skip
     try:
         node = NodeServer(chain, port=DEFAULT_PORT)
         node.start()
@@ -780,17 +836,19 @@ def main():
 
     while True:
         print(
-            """
+            f"""
 Commands:
   1) New wallet          2) Show balance
   3) Faucet (get coins)  4) Send transaction
   5) Mine block          6) Show chain
   7) Validate chain      8) Quit
 
-Network (v0.2):
+Network:
   9)  List peers         10) Add peer
   11) Remove peer        12) Sync now
   13) Node status        14) Start node (custom port)
+
+Current: {len(chain.chain)} blocks | difficulty {chain.current_difficulty} | mempool {len(chain.pending)}
 """
         )
         choice = input("Vexlore> ").strip()
@@ -831,15 +889,17 @@ Network (v0.2):
         elif choice == "6":
             print(f"\n=== {CHAIN_NAME} ({len(chain.chain)} blocks) ===")
             for b in chain.chain:
-                print(f"\nBlock #{b.index}  {b.hash[:20]}...")
+                print(f"\nBlock #{b.index}  {b.hash[:20]}...  (diff={b.difficulty})")
                 print(f"  Prev : {b.previous_hash[:20]}...")
                 print(f"  Nonce: {b.nonce}  Miner: {b.miner[:16]}...")
                 for t in b.transactions:
                     print(f"    TX {t.tx_id[:8]}  {t.amount} VEX  {t.sender[:12]} → {t.recipient[:12]}")
 
         elif choice == "7":
+            start = time.time()
             valid = chain.is_valid()
-            print(f"Chain valid: {valid}")
+            elapsed = time.time() - start
+            print(f"Chain valid: {valid}  (checked in {elapsed:.3f}s)")
 
         elif choice in ("8", "q", "quit", "exit"):
             if node:
@@ -847,7 +907,6 @@ Network (v0.2):
             print("Goodbye from Vexlore.")
             break
 
-        # ---- Network commands ----
         elif choice == "9":
             if not node:
                 print("[-] Node not running")
@@ -889,8 +948,9 @@ Network (v0.2):
                 continue
             print(f"Self URL     : {node.self_url}")
             print(f"Blocks       : {len(chain.chain)}")
+            print(f"Difficulty   : {chain.current_difficulty}")
             print(f"Last hash    : {chain.last_block.hash[:24]}...")
-            print(f"Pending txs  : {len(chain.pending)}")
+            print(f"Mempool      : {len(chain.pending)} txs")
             print(f"Peers        : {len(node.peers.peers)}")
             print(f"Version      : {VERSION}")
 
