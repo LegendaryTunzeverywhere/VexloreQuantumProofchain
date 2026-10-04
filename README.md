@@ -32,7 +32,7 @@ Uses real **ML-DSA-44** (NIST FIPS 204 / Dilithium) signatures — resistant to 
 ## Quick Start
 
 ```bash
-pip install requests cryptography
+python -m pip install -r requirements.txt
 python3 vexlore_chain.py
 ```
 

@@ -50,8 +50,8 @@ sys.path.insert(0, str(Path(__file__).parent / "dilithium_src"))
 try:
     from dilithium_py.ml_dsa import ML_DSA_44  # type: ignore
 except ImportError:
-    print("[-] dilithium_src not found. Place the pure-Python ML-DSA package next to this file.")
-    print("    Expected: dilithium_src/dilithium_py/ml_dsa.py")
+    print("[-] ML-DSA dependency not found.")
+    print("    Install project dependencies with: python -m pip install -r requirements.txt")
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
