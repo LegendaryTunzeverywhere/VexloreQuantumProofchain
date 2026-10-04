@@ -25,25 +25,7 @@ with patch.dict(sys.modules, {
 class SecurityTests(unittest.TestCase):
     def make_chain(self):
         chain = object.__new__(chain_module.VexloreChain)
-        genesis_tx = chain_module.Transaction(
-            tx_id="genesis",
-            sender="VEXLORE_NETWORK",
-            recipient="VEXLORE_NETWORK",
-            amount=0.0,
-            timestamp=100.0,
-            public_key="",
-            signature="",
-            memo="Genesis",
-        )
-        genesis = chain_module.Block(
-            index=0,
-            timestamp=100.0,
-            transactions=[genesis_tx],
-            previous_hash="0" * 64,
-            difficulty=chain_module.INITIAL_DIFFICULTY,
-            miner="genesis",
-        )
-        genesis.hash = genesis.compute_hash()
+        genesis = chain_module.canonical_genesis_block()
         chain.chain = [genesis]
         chain.pending = []
         chain.balances = {}
@@ -54,14 +36,14 @@ class SecurityTests(unittest.TestCase):
     def make_reward_block(self, chain, amount=chain_module.BLOCK_REWARD, difficulty=None):
         block = chain_module.Block(
             index=len(chain.chain),
-            timestamp=101.0,
+            timestamp=chain_module.GENESIS_TIMESTAMP + 1.0,
             transactions=[
                 chain_module.Transaction(
                     tx_id="reward-1",
                     sender="VEXLORE_NETWORK",
                     recipient="miner",
                     amount=amount,
-                    timestamp=101.0,
+                    timestamp=chain_module.GENESIS_TIMESTAMP + 1.0,
                     public_key="",
                     signature="",
                     memo="Block reward",
@@ -97,7 +79,7 @@ class SecurityTests(unittest.TestCase):
             sender="victim",
             recipient="attacker",
             amount=5.0,
-            timestamp=101.0,
+            timestamp=chain_module.GENESIS_TIMESTAMP + 1.0,
             public_key=b"attacker-key".hex(),
             signature="00",
         )
@@ -129,6 +111,38 @@ class SecurityTests(unittest.TestCase):
         chain = self.make_chain()
         block = self.make_reward_block(chain, difficulty=0)
         self.assertFalse(chain.add_block_from_peer(block))
+
+    def test_alternate_genesis_is_not_accepted(self):
+        local_chain = self.make_chain()
+        alternate = chain_module.Block(
+            index=0,
+            timestamp=1.0,
+            transactions=[],
+            previous_hash="0" * 64,
+            difficulty=chain_module.INITIAL_DIFFICULTY,
+            miner="genesis",
+        )
+        alternate.hash = alternate.compute_hash()
+        remote_chain = self.make_chain()
+        remote_chain.chain = [alternate]
+        remote_chain.chain.append(self.make_reward_block(remote_chain))
+        self.assertFalse(local_chain.replace_chain(remote_chain.chain))
+        self.assertEqual(local_chain.chain[0].hash, chain_module.canonical_genesis_block().hash)
+
+    def test_sync_does_not_auto_add_advertised_peers(self):
+        server = object.__new__(chain_module.NodeServer)
+        server.chain = self.make_chain()
+        server.self_url = "http://127.0.0.1:5000"
+        server.peers = chain_module.PeerManager.__new__(chain_module.PeerManager)
+        server.peers.peers = {"http://8.8.8.8:5000"}
+        with patch.object(server.peers, "fetch_chain", return_value=None), patch.object(
+            server.peers, "fetch_peers", return_value=["http://1.1.1.1:80"]
+        ) as fetch_peers, patch.object(server.peers, "add") as add_peer, patch.object(
+            server.peers, "request"
+        ):
+            server.sync_with_peers()
+        add_peer.assert_not_called()
+        fetch_peers.assert_not_called()
 
     def test_valid_reward_is_accepted_and_chain_validates(self):
         chain = self.make_chain()
@@ -193,9 +207,19 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(loaded.current_difficulty, chain_module.INITIAL_DIFFICULTY)
 
     def test_invalid_saved_chain_is_archived_before_reset(self):
-        chain = self.make_chain()
-        invalid = self.make_reward_block(chain, amount=1_000_000.0)
-        stored = {"chain": [chain.chain[0].to_dict(), invalid.to_dict()]}
+        remote_chain = self.make_chain()
+        alternate_genesis = chain_module.Block(
+            index=0,
+            timestamp=1.0,
+            transactions=[],
+            previous_hash="0" * 64,
+            difficulty=chain_module.INITIAL_DIFFICULTY,
+            miner="genesis",
+        )
+        alternate_genesis.hash = alternate_genesis.compute_hash()
+        remote_chain.chain = [alternate_genesis]
+        invalid = self.make_reward_block(remote_chain, amount=1_000_000.0)
+        stored = {"chain": [alternate_genesis.to_dict(), invalid.to_dict()]}
         with tempfile.TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir) / "data"
             data_dir.mkdir()

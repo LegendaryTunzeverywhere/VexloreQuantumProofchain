@@ -67,6 +67,7 @@ MIN_DIFFICULTY = 2
 MAX_DIFFICULTY = 6
 MAX_TX_PER_BLOCK = 50
 BLOCK_REWARD = 10.0
+GENESIS_TIMESTAMP = 0.0
 DEFAULT_PORT = 5000
 SYNC_INTERVAL = 15
 MNEMONIC_WORDS = 12
@@ -388,6 +389,30 @@ class Block:
                    previous_hash=d["previous_hash"], difficulty=d.get("difficulty", INITIAL_DIFFICULTY),
                    nonce=d.get("nonce", 0), hash=d.get("hash", ""), miner=d.get("miner", ""))
 
+
+def canonical_genesis_block() -> Block:
+    transaction = Transaction(
+        tx_id="genesis",
+        sender="VEXLORE_NETWORK",
+        recipient="VEXLORE_NETWORK",
+        amount=0.0,
+        timestamp=GENESIS_TIMESTAMP,
+        public_key="",
+        signature="",
+        memo="Genesis of Vexlore – Quantumproof by design",
+    )
+    block = Block(
+        index=0,
+        timestamp=GENESIS_TIMESTAMP,
+        transactions=[transaction],
+        previous_hash="0" * 64,
+        difficulty=INITIAL_DIFFICULTY,
+        miner="genesis",
+    )
+    block.hash = block.compute_hash()
+    return block
+
+
 class Wallet:
     def __init__(self, name: str = "default", password: Optional[str] = None):
         self.name = name
@@ -625,12 +650,7 @@ class VexloreChain:
         self.chain = []
         self.pending = []
         self.balances = {}
-        genesis_tx = Transaction(tx_id="genesis", sender="VEXLORE_NETWORK", recipient="VEXLORE_NETWORK",
-                                 amount=0.0, timestamp=time.time(), public_key="", signature="",
-                                 memo="Genesis of Vexlore – Quantumproof by design")
-        block = Block(index=0, timestamp=time.time(), transactions=[genesis_tx],
-                      previous_hash="0" * 64, difficulty=INITIAL_DIFFICULTY, miner="genesis")
-        block.hash = block.compute_hash()
+        block = canonical_genesis_block()
         self.chain.append(block)
         self.current_difficulty = INITIAL_DIFFICULTY
         self._save()
@@ -861,7 +881,7 @@ class VexloreChain:
             or not self._finite_number(genesis.timestamp)
             or not isinstance(genesis.transactions, list)
             or not isinstance(genesis.hash, str)
-            or genesis.hash != genesis.compute_hash()
+            or genesis.to_dict() != canonical_genesis_block().to_dict()
         ):
             return False
         balances: Dict[str, float] = {}
@@ -1220,8 +1240,6 @@ class NodeServer:
             remote = self.peers.fetch_chain(peer)
             if remote and len(remote) > best_len and self.chain.is_valid(remote):
                 best_chain, best_len = remote, len(remote)
-            for p in self.peers.fetch_peers(peer):
-                self.peers.add(p)
             try:
                 self.peers.request("post", peer, "/peers", json={"url": self.self_url}, timeout=4)
             except Exception:

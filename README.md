@@ -76,8 +76,8 @@ vexlore/
 - Seed phrase = full control of the wallet. Never share it.
 - Wallet file is encrypted; without the password the secrets stay safe.
 - The node binds to `127.0.0.1` by default. Choose a different bind address only when you intend to expose the HTTP API.
-- Peer URLs must use HTTP(S) with a globally routable IP address literal; hostnames, loopback, private, link-local, and other non-public destinations are rejected to prevent DNS rebinding and SSRF. Peer redirects are not followed.
-- Arbitrary faucet transactions are disabled. Valid blocks must contain exactly one fixed 10 VEX miner reward and valid, funded, sender-authenticated transactions. Saved chains that fail these consensus checks are archived as `*.invalid-<timestamp>` and replaced with a new genesis chain.
+- Peer URLs must use HTTP(S) with a globally routable IP address literal; hostnames, loopback, private, link-local, and other non-public destinations are rejected to prevent DNS rebinding and SSRF. Peer redirects are not followed, and peers advertised by another node are not contacted automatically; add peers explicitly.
+- Arbitrary faucet transactions are disabled. Valid blocks must contain exactly one fixed 10 VEX miner reward and valid, funded, sender-authenticated transactions. Chains must use the fixed canonical genesis block. Existing saved chains that fail these consensus checks are archived as `*.invalid-<timestamp>` and replaced with a new genesis chain.
 - This is **not** production software. Do not put real money on it.
 
 Have fun exploring post-quantum crypto!
